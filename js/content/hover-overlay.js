@@ -149,24 +149,28 @@
   // ── BLOCK FROM CURSOR POINT ────────────────────────────────────────────────
 
   function blockFromPoint(x, y) {
-    if (document.caretRangeFromPoint) {
-      const range = document.caretRangeFromPoint(x, y);
-      if (range) {
-        let node = range.startContainer;
-        if (node.nodeType === Node.TEXT_NODE) node = node.parentElement;
-        while (node && node !== document.body) {
-          const idx = blockMap.get(node);
-          if (idx !== undefined) return idx;
-          node = node.parentElement;
+    try {
+      if (document.caretRangeFromPoint) {
+        const range = document.caretRangeFromPoint(x, y);
+        if (range) {
+          let node = range.startContainer;
+          if (node.nodeType === Node.TEXT_NODE) node = node.parentElement;
+          while (node && node !== document.body) {
+            const idx = blockMap.get(node);
+            if (idx !== undefined) return idx;
+            node = node.parentElement;
+          }
         }
       }
-    }
+    } catch (_) { /* cross-origin frame, ShadowRoot, or detached node */ }
     let best = -1, bestD = Infinity;
     blocks.forEach((el, i) => {
-      const r = el.getBoundingClientRect();
-      if (r.width === 0 && r.height === 0) return;
-      const d = Math.abs((r.top + r.bottom) / 2 - y);
-      if (d < bestD) { bestD = d; best = i; }
+      try {
+        const r = el.getBoundingClientRect();
+        if (r.width === 0 && r.height === 0) return;
+        const d = Math.abs((r.top + r.bottom) / 2 - y);
+        if (d < bestD) { bestD = d; best = i; }
+      } catch (_) {}
     });
     return best;
   }
@@ -178,6 +182,31 @@
     try {
       return [...range.getClientRects()].filter(r => r.width > 4 && r.height > 0);
     } catch (_) { return []; }
+  }
+
+  // ── CURSOR HIT-TEST ────────────────────────────────────────────────────────
+  //
+  // caretRangeFromPoint() snaps to the nearest character even when the cursor
+  // is in empty margin space beside a line.  We reject hover unless the cursor
+  // is physically over (or between adjacent lines of) the sentence's text rects.
+  //
+  //   PAD_X — small horizontal fuzz so the very edge of a glyph still triggers
+  //   inter-line gap — if cursor Y is between rect[i].bottom and rect[i+1].top
+  //     (the typographic leading gap) we still consider it "over" the sentence
+
+  function cursorNearRects(x, y, rects) {
+    if (!rects.length) return false;
+    const PAD_X = 4;
+    for (let i = 0; i < rects.length; i++) {
+      const r = rects[i];
+      // Cursor must be horizontally inside the text run (± PAD_X)
+      if (x < r.left - PAD_X || x > r.right + PAD_X) continue;
+      // Vertically inside this line rect
+      if (y >= r.top && y <= r.bottom) return true;
+      // Vertically in the leading gap between this line and the next
+      if (i + 1 < rects.length && y > r.bottom && y < rects[i + 1].top) return true;
+    }
+    return false;
   }
 
   // ── SVG HELPERS ────────────────────────────────────────────────────────────
@@ -225,17 +254,22 @@
   function clearHover() { clearSvg(hovSvg); }
 
   function updateHover(x, y) {
-    const idx = blockFromPoint(x, y);
-    if (idx < 0) { clearHover(); return; }
-    const el = blocks[idx];
-    if (!el) { clearHover(); return; }   // stale index — rescan pending
-    const sents = getSentences(el);
-    const off   = charOffsetInBlock(x, y, el);
-    const sent  = sentenceAt(sents, off);
-    if (!sent) { clearHover(); return; }
-    const range = createRangeForChars(el, sent.start, sent.end);
-    ensureHovSvg();
-    fillSvg(hovSvg, getLineRects(range), HOVER_COLOR, HOVER_ALPHA);
+    try {
+      const idx = blockFromPoint(x, y);
+      if (idx < 0) { clearHover(); return; }
+      const el = blocks[idx];
+      if (!el) { clearHover(); return; }   // stale index — rescan pending
+      const sents = getSentences(el);
+      const off   = charOffsetInBlock(x, y, el);
+      const sent  = sentenceAt(sents, off);
+      if (!sent) { clearHover(); return; }
+      const range = createRangeForChars(el, sent.start, sent.end);
+      const rects = getLineRects(range);
+      // Reject if cursor is in the empty margin beside the text line
+      if (!cursorNearRects(x, y, rects)) { clearHover(); return; }
+      ensureHovSvg();
+      fillSvg(hovSvg, rects, HOVER_COLOR, HOVER_ALPHA);
+    } catch (_) { clearHover(); }
   }
 
   // ── PLAYBACK HIGHLIGHT ─────────────────────────────────────────────────────
@@ -350,35 +384,39 @@
   // ── CLICK-TO-SEEK ──────────────────────────────────────────────────────────
 
   function handlePointerUp(e) {
-    if (e.button !== 0) return;
-    if (window.getSelection().toString().length > 0) return;
-    if (e.target.closest && e.target.closest(INTERACTIVE)) return;
+    try {
+      if (e.button !== 0) return;
+      if (window.getSelection().toString().length > 0) return;
+      if (e.target.closest && e.target.closest(INTERACTIVE)) return;
 
-    const idx = blockFromPoint(e.clientX, e.clientY);
-    if (idx < 0) return;
-    const el = blocks[idx];
-    if (!el) return;   // stale index — rescan pending
-    const sents = getSentences(el);
-    const off   = charOffsetInBlock(e.clientX, e.clientY, el);
-    const sent  = sentenceAt(sents, off);
-    if (!sent) return;
+      const idx = blockFromPoint(e.clientX, e.clientY);
+      if (idx < 0) return;
+      const el = blocks[idx];
+      if (!el) return;   // stale index — rescan pending
+      const sents = getSentences(el);
+      const off   = charOffsetInBlock(e.clientX, e.clientY, el);
+      const sent  = sentenceAt(sents, off);
+      if (!sent) return;
 
-    // Signal html-doc.js's parse() to start from this sentence
-    window.__raSeekTarget = {
-      el:           el,
-      sentenceText: sent.text.replace(/\s+/g, ' ').trim()
-    };
+      // Signal html-doc.js's parse() to start from this sentence
+      window.__raSeekTarget = {
+        el:           el,
+        sentenceText: sent.text.replace(/\s+/g, ' ').trim()
+      };
 
-    // Clear both overlays — they will repopulate once new playback starts
-    clearHover();
-    clearPlayback();
+      // Clear both overlays — they will repopulate once new playback starts
+      clearHover();
+      clearPlayback();
 
-    safeSend({ dest: 'serviceWorker', method: 'stop' })
-      .catch(function () {})
-      .then(function () {
-        return safeSend({ dest: 'serviceWorker', method: 'playTab' });
-      })
-      .catch(function (err) { console.error('[RA hover] playTab failed:', err); });
+      safeSend({ dest: 'serviceWorker', method: 'stop' })
+        .catch(function () {})
+        .then(function () {
+          return safeSend({ dest: 'serviceWorker', method: 'playTab' });
+        })
+        .catch(function (err) { console.error('[RA hover] playTab failed:', err); });
+    } catch (err) {
+      console.error('[RA hover] click handler error:', err);
+    }
   }
 
   // ── BLOCK SCANNING ─────────────────────────────────────────────────────────
