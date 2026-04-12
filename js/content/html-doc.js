@@ -71,8 +71,49 @@ var readAloudDoc = new function() {
     }
     $(toRead).addClass("read-aloud");   //for debugging only
 
-    //extract texts
-    return toRead.flatMap(getTexts).filter(isNotEmpty);
+    //extract texts — honouring a seek target set by hover-overlay.js click
+    var seekTarget = window.__raSeekTarget || null;
+    if (seekTarget) window.__raSeekTarget = null;
+
+    // Pre-filter: skip toRead entries that come before the block containing
+    // the clicked element.  html-doc's blocks are parent containers (<div>,
+    // <article>, …) while hover-overlay tracks <p> elements, so we check
+    // containment in both directions.
+    if (seekTarget && seekTarget.el) {
+      for (var si = 0; si < toRead.length; si++) {
+        var te = toRead[si];
+        if (te === seekTarget.el || te.contains(seekTarget.el) || seekTarget.el.contains(te)) {
+          if (si > 0) toRead = toRead.slice(si);
+          break;
+        }
+      }
+    }
+
+    var texts = toRead.flatMap(getTexts).filter(isNotEmpty);
+
+    // Sentence-level seek: scan ALL extracted texts for the clicked sentence
+    // (must scan all, not just texts[0], because the target paragraph may be
+    // the 3rd, 5th, … chunk returned by a multi-block container element).
+    if (seekTarget && seekTarget.sentenceText) {
+      var needle = seekTarget.sentenceText;
+      // Also prepare a short prefix for fallback matching (handles minor
+      // innerText vs textContent whitespace differences)
+      var needlePrefix = needle.slice(0, 40);
+      for (var ti = 0; ti < texts.length; ti++) {
+        var hay = texts[ti];
+        var pos = hay.indexOf(needle);
+        if (pos < 0) pos = hay.toLowerCase().indexOf(needle.toLowerCase());
+        if (pos < 0) pos = hay.indexOf(needlePrefix);
+        if (pos < 0) pos = hay.toLowerCase().indexOf(needlePrefix.toLowerCase());
+        if (pos >= 0) {
+          texts = texts.slice(ti);
+          if (pos > 0) texts[0] = texts[0].slice(pos);
+          break;
+        }
+      }
+    }
+
+    return texts;
   }
 
   function findTextBlocks(threshold) {

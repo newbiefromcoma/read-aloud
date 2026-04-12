@@ -1,7 +1,7 @@
 {
   "name": "read-aloud",
-  "version": "1.0.1",
-  "description": "A Chrome extension that reads aloud the webpage's content with just one click. Support 40+ languages.",
+  "version": "1.1.0",
+  "description": "A Chrome extension that reads aloud the webpage's content with just one click. Support 40+ languages. Fork adds Speechify-style hover sentence preview and click-to-seek playback.",
   "directories": {
     "doc": "docs"
   },
