@@ -227,7 +227,8 @@
   function updateHover(x, y) {
     const idx = blockFromPoint(x, y);
     if (idx < 0) { clearHover(); return; }
-    const el    = blocks[idx];
+    const el = blocks[idx];
+    if (!el) { clearHover(); return; }   // stale index — rescan pending
     const sents = getSentences(el);
     const off   = charOffsetInBlock(x, y, el);
     const sent  = sentenceAt(sents, off);
@@ -355,7 +356,8 @@
 
     const idx = blockFromPoint(e.clientX, e.clientY);
     if (idx < 0) return;
-    const el    = blocks[idx];
+    const el = blocks[idx];
+    if (!el) return;   // stale index — rescan pending
     const sents = getSentences(el);
     const off   = charOffsetInBlock(e.clientX, e.clientY, el);
     const sent  = sentenceAt(sents, off);
@@ -443,6 +445,42 @@
 
   // Click to seek
   document.addEventListener('pointerup', handlePointerUp, { capture: true });
+
+  // ── SPA / DYNAMIC CONTENT RESCAN ──────────────────────────────────────────
+  //
+  // React/Vue SPAs tear down and rebuild DOM on navigation.  When that happens
+  // blocks[] and blockMap become stale — old indices no longer map to live
+  // elements.  Watch for structural DOM mutations and re-scan after a short
+  // debounce (500 ms) so the new content is fully rendered first.
+  // Changes inside our own SVG overlay divs are deliberately ignored.
+
+  let rescanTimer = null;
+
+  function scheduleRescan() {
+    if (rescanTimer) clearTimeout(rescanTimer);
+    rescanTimer = setTimeout(function () {
+      rescanTimer = null;
+      clearHover();
+      clearPlayback();
+      sentCache = new WeakMap();   // sentence splits for old elements are stale
+      scanBlocks();
+    }, 500);
+  }
+
+  const domObserver = new MutationObserver(function (mutations) {
+    for (let i = 0; i < mutations.length; i++) {
+      const m = mutations[i];
+      if (m.type !== 'childList') continue;
+      if (m.addedNodes.length === 0 && m.removedNodes.length === 0) continue;
+      // Skip mutations inside our own overlay wrappers
+      if (hovWrap && hovWrap.contains(m.target)) continue;
+      if (actWrap && actWrap.contains(m.target)) continue;
+      scheduleRescan();
+      return;   // one rescan is enough — debounce handles the rest
+    }
+  });
+
+  domObserver.observe(document.body, { childList: true, subtree: true });
 
   // ── INIT ───────────────────────────────────────────────────────────────────
 
