@@ -61,9 +61,21 @@ Inspired by how Speechify highlights text as you hover over it, this fork adds t
 
 This works on all standard HTML pages (articles, blogs, news sites, docs). It is not active on PDF viewer, Google Docs, Kindle, or other special-purpose content handlers.
 
+### Real-time playback sentence highlight (v2.24.0)
+
+While Read Aloud is speaking, the sentence currently being read is highlighted with an amber rounded rectangle — similar to how Speechify tracks the reader's position through the page.
+
+| Behaviour | Detail |
+|-----------|--------|
+| **Amber highlight** follows playback | The currently-spoken sentence is underlined with a warm amber glow, line by line |
+| **Auto-scroll** | If the highlighted sentence scrolls out of view, the page smoothly centres on it |
+| **Scroll repositioning** | Scrolling by hand instantly redraws the amber highlight at its new screen position (no 300 ms wait) |
+| **Hover coexists** | The purple hover preview and the amber playback highlight are on separate SVG layers; both can be visible simultaneously |
+| **Clears on stop/pause** | The amber overlay disappears as soon as playback stops or pauses |
+
 #### How it works — technical summary
 
-Three files were changed/added:
+Four files were changed/added:
 
 **`js/content/hover-overlay.js`** *(new)* — a self-contained IIFE injected after `html-doc.js`:
 
@@ -73,8 +85,11 @@ Three files were changed/added:
 4. **Sentence splitting** — regex `/([.!?]['"»)\]]*)\s+(?=[A-Z"'«(\[])/g` with an abbreviation skip-list (`Dr.`, `Mr.`, `U.S.`, `e.g.`, etc.) to avoid false sentence breaks.
 5. **DOM Range** — `TreeWalker` maps `[charStart, charEnd]` back to a real `Range` object.
 6. **Line rects** — `Range.getClientRects()` returns one `DOMRect` per visual rendered line.
-7. **SVG overlay** — one `<rect rx="3">` per line rect inside a `position:fixed` SVG div; cleared on scroll and repainted on the next `mousemove`.
+7. **Two SVG overlay layers** — a purple layer (z:2147483646) for hover preview and an amber layer (z:2147483644) for playback; one `<rect rx="3">` per line rect inside each `position:fixed` SVG div.
 8. **Click handler** — stores `window.__raSeekTarget = { el, sentenceText }` then sends `stop` → `playTab` to the Read Aloud service worker.
+9. **Playback polling** — a 300 ms `setInterval` calls `getPlaybackState` on the service worker; uses a change-key (`"index:text"`) so DOM repaints only happen when the spoken sentence actually changes.
+10. **Stored Range** — the active `Range` is persisted between polls so scroll events can immediately repaint the amber overlay at the new screen position without waiting for the next poll.
+11. **Auto-scroll** — when the highlighted sentence is outside the viewport, `scrollIntoView({ behavior: 'smooth', block: 'center' })` re-centres the page.
 
 **`js/content/html-doc.js`** *(modified)* — `parse()` checks `window.__raSeekTarget` after building the `toRead` element array:
 
@@ -83,6 +98,8 @@ Three files were changed/added:
 3. Scans **all** extracted text strings for the sentence text and trims from there — this is critical because a multi-block container produces many text chunks and the target sentence may be in any of them.
 
 **`js/content.js`** *(modified)* — the default `getRequireJs()` branch now returns `["js/content/html-doc.js", "js/content/hover-overlay.js"]` so the overlay is injected for all standard HTML pages.
+
+**`manifest.json`** *(modified)* — version bumped `2.23.0` → `2.24.0` to reflect the playback highlight addition.
 
 <hr />
 
@@ -135,9 +152,17 @@ ALT/Option + Period      : Forward
 
 After pressing Play at least once on a page (so Read Aloud's content script is active):
 
-- Move your mouse over any paragraph — the sentence under the cursor is highlighted.
+- Move your mouse over any paragraph — the sentence under the cursor is highlighted in purple.
 - Click the highlighted sentence to start reading from that exact point.
 - Click a different sentence mid-playback to jump there instantly.
+
+### Playback Highlight
+
+While reading is active, the sentence currently being spoken is highlighted in amber:
+
+- The amber highlight follows Read Aloud sentence by sentence as playback progresses.
+- If the highlighted sentence scrolls out of view, the page auto-scrolls to keep it visible.
+- Scrolling manually instantly repositions the amber overlay at its new screen position.
 
 ### Customization
 
@@ -199,8 +224,8 @@ This fork tracks [ken107/read-aloud](https://github.com/ken107/read-aloud).
 Fork-specific changes live on the `feature/speechify-hover-click` branch and are limited to:
 
 ```
-js/content/hover-overlay.js   (new file)
+js/content/hover-overlay.js   (new file — hover preview, click-to-seek, playback highlight)
 js/content/html-doc.js        (seek-target logic added to parse())
 js/content.js                 (hover-overlay.js added to getRequireJs())
-manifest.json                 (version bump 2.22.0 → 2.23.0)
+manifest.json                 (version bump 2.22.0 → 2.24.0)
 ```
