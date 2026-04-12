@@ -302,9 +302,7 @@
   async function pollPlayback() {
     let result;
     try {
-      result = await brapi.runtime.sendMessage({
-        dest: 'serviceWorker', method: 'getPlaybackState'
-      });
+      result = await safeSend({ dest: 'serviceWorker', method: 'getPlaybackState' });
     } catch (_) { return; }  // service worker sleeping or no player yet
 
     if (!result || result.state !== 'PLAYING') {
@@ -328,6 +326,24 @@
     lastPlayKey = key;
 
     applyPlaybackHighlight(text);
+  }
+
+  // ── SAFE MESSAGING ────────────────────────────────────────────────────────
+  //
+  // chrome.runtime.sendMessage() throws synchronously with
+  // "Extension context invalidated" when the service worker has restarted
+  // (idle timeout, extension reload) while this content script is still live.
+  // That happens before a Promise is returned, so .catch() on the call-site
+  // can't catch it.  Wrap every outgoing message here instead.
+
+  function safeSend(msg) {
+    try {
+      const p = brapi.runtime.sendMessage(msg);
+      // brapi may return undefined for one-way messages
+      return (p && typeof p.then === 'function') ? p : Promise.resolve(null);
+    } catch (_) {
+      return Promise.resolve(null);
+    }
   }
 
   // ── CLICK-TO-SEEK ──────────────────────────────────────────────────────────
@@ -355,10 +371,10 @@
     clearHover();
     clearPlayback();
 
-    brapi.runtime.sendMessage({ dest: 'serviceWorker', method: 'stop' })
+    safeSend({ dest: 'serviceWorker', method: 'stop' })
       .catch(function () {})
       .then(function () {
-        return brapi.runtime.sendMessage({ dest: 'serviceWorker', method: 'playTab' });
+        return safeSend({ dest: 'serviceWorker', method: 'playTab' });
       })
       .catch(function (err) { console.error('[RA hover] playTab failed:', err); });
   }
