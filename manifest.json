@@ -61,7 +61,20 @@
     }
   ],
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "scripts": [
+      "js/rxjs.umd.min.js",
+      "js/defaults.js",
+      "js/messaging.js",
+      "js/content-handlers.js",
+      "js/events.js"
+    ]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "read-aloud-fork@crossbowsec.com",
+      "strict_min_version": "128.0"
+    }
   },
   "options_page": "options.html",
   "options_ui": {
