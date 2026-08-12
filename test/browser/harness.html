@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Read Aloud hover-overlay harness</title>
+<style>
+  body { font: 16px/1.65 Georgia, serif; max-width: 700px; margin: 30px auto; }
+
+  /* Fixed height so the article below never shifts as tests report. Mouse
+     coordinates in the runner are recomputed anyway, but a stable layout keeps
+     the two phases comparable. */
+  #results { font: 13px/1.5 monospace; background: #111; color: #eee; padding: 12px;
+             white-space: pre-wrap; height: 180px; overflow: auto; }
+  .ok { color: #6f6 } .fail { color: #f66 }
+
+  /* Generous vertical spacing is load-bearing, not decoration.
+     hover-overlay.js's blockFromPoint() only uses caretRangeFromPoint(), which
+     Firefox does not implement, so on Firefox it always falls back to "the block
+     whose vertical centre is nearest to y" -- x is ignored entirely. Blocks that
+     sit close together vertically therefore steal each other's hits on Firefox.
+     Spacing them out lets the same coordinates resolve the same block on both
+     engines, so the tests measure the overlay rather than the fallback. */
+  article p  { margin: 40px 0 }
+  article h1 { margin: 0 0 48px }
+  article h2 { margin: 56px 0 }
+  #plong     { margin: 90px 0 }
+  ul#list    { margin: 56px 0; padding-left: 28px }
+  ul#list li { margin: 26px 0 }
+  blockquote { margin: 70px 20px; padding: 6px 0 6px 18px; border-left: 3px solid #ccc }
+  aside      { margin: 60px 0; color: #666 }
+</style>
+</head>
+<body>
+
+<div id="results">running…</div>
+
+<article id="doc">
+  <h1>The Rise of Ambient Computing</h1>
+
+  <p id="p1">Ambient computing did not arrive with a single product launch. It crept in through a hundred small conveniences that nobody ever voted for.</p>
+
+  <!-- 10 characters: below MIN_TEXT (12), must never become a block -->
+  <p id="p2">Nope tiny.</p>
+
+  <!-- exactly 12 characters: on the MIN_TEXT boundary, must become a block -->
+  <p id="pmin">Twelve chars</p>
+
+  <h2 id="h2">Why the shape of the page matters</h2>
+
+  <p id="plong">The first sentence sets up the argument and takes up most of the opening line of this deliberately long paragraph. The second sentence develops the same idea a good deal further and carries on well past the end of the line it started on. A third sentence turns up somewhere around the middle of the block and keeps going for a while yet. The fourth and final sentence closes the whole thing out without any particular ceremony.</p>
+
+  <ul id="list">
+    <li id="li1">Sensors became cheap enough to scatter absolutely everywhere.</li>
+    <li id="li2">Models became small enough to run on the device in your pocket.</li>
+    <li id="li3">Bandwidth stopped being the limiting factor for most of these workloads.</li>
+  </ul>
+
+  <p id="plink">A paragraph with <a href="#nowhere" id="thelink">an inline link sitting right here</a> embedded in the middle of it.</p>
+
+  <!-- Shaped like a Wikipedia paragraph: a citation marker sits between the full
+       stop and the space after it. html-doc.js drops <sup> before the engine ever
+       sees the text, so the overlay has to drop it too — otherwise the stop has no
+       whitespace behind it, the sentence boundary vanishes, and the two sentences
+       become a single un-pickable hover target. Kept on one source line so the
+       character offsets are exactly predictable. -->
+  <p id="pcite">Systems differ in the size of the stored speech units, and may lack clarity.<sup id="thecite" class="reference">[citation needed]</sup> For specific usage domains, the storage of entire words allows for high-quality output.</p>
+
+  <!-- A <p> nested inside a <blockquote>. scanBlocks()'s walk() stops descending
+       as soon as it meets a BLOCK_TAG, so the blockquote is the block and the
+       inner <p> is never counted. The lead-in text node is what makes that
+       observable. Kept on one source line so textContent is exactly predictable. -->
+  <blockquote id="bq">Lead-in quotation line here. <p id="bqp">Quoted sentence one goes here. Quoted sentence two goes here.</p></blockquote>
+
+  <aside id="side">
+    <p id="asidep">Sidebar note that must never be read aloud.</p>
+  </aside>
+</article>
+
+<div id="dynamic"></div>
+<div id="tail" style="height: 700px"></div>
+
+<!-- ── extension environment stand-ins (must run before hover-overlay.js) ── -->
+<script>
+  // Every outgoing message is recorded. getPlaybackState answers with whatever
+  // __fakeState currently holds, so a test can drive the playback highlight by
+  // assigning to it.
+  window.__sent = []
+  window.__fakeState = { state: 'STOPPED' }
+
+  window.brapi = {
+    runtime: {
+      sendMessage: function (msg) {
+        window.__sent.push({ dest: msg && msg.dest, method: msg && msg.method })
+        if (msg && msg.method === 'getPlaybackState') return Promise.resolve(window.__fakeState)
+        return Promise.resolve(null)
+      }
+    }
+  }
+
+  // hover-overlay.js reads readAloudDoc.ignoreTags if the global exists.
+  var readAloudDoc = {
+    ignoreTags: 'select,textarea,button,label,audio,video,dialog,embed,nav,noframes,noscript,object,script,style,svg,aside,footer'
+  }
+
+  // ---- overlay inspection helpers (used in-page and by the runner) ----------
+  // The two layers are plain fixed divs identified only by their z-index.
+  var HOVER_Z = 2147483646, PLAY_Z = 2147483644
+
+  window.__layer = function (z) {
+    return Array.prototype.find.call(document.body.children,
+      function (el) { return el.style && el.style.zIndex === String(z) })
+  }
+  window.__rectsIn = function (z) {
+    var layer = window.__layer(z)
+    if (!layer) return []
+    return Array.prototype.map.call(layer.querySelectorAll('rect'), function (r) {
+      return {
+        x: parseFloat(r.getAttribute('x')), y: parseFloat(r.getAttribute('y')),
+        w: parseFloat(r.getAttribute('width')), h: parseFloat(r.getAttribute('height')),
+        rx: r.getAttribute('rx'),
+        fill: r.getAttribute('fill'), alpha: r.getAttribute('fill-opacity')
+      }
+    })
+  }
+  window.__hoverRects = function () { return window.__rectsIn(HOVER_Z) }
+  window.__playRects  = function () { return window.__rectsIn(PLAY_Z) }
+
+  // Does any rect in `rects` overlap the element's box?
+  window.__rectsOver = function (rects, id) {
+    var b = document.getElementById(id).getBoundingClientRect()
+    return rects.some(function (r) {
+      return r.x < b.right && r.x + r.w > b.left && r.y < b.bottom && r.y + r.h > b.top
+    })
+  }
+
+  // A DOM Range over the first occurrence of `needle` in el.textContent.
+  window.__rangeForText = function (el, needle) {
+    var tc = el.textContent
+    var start = tc.indexOf(needle)
+    if (start < 0) return null
+    var end = start + needle.length
+    var w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+    var off = 0, sN = null, sO = 0, eN = null, eO = 0
+    for (var n; (n = w.nextNode());) {
+      var len = n.textContent.length
+      if (!sN && off + len > start) { sN = n; sO = start - off }
+      if (sN && off + len >= end) { eN = n; eO = end - off; break }
+      off += len
+    }
+    if (!sN) return null
+    var r = document.createRange()
+    r.setStart(sN, sO)
+    r.setEnd(eN || sN, eN ? eO : sN.textContent.length)
+    return r
+  }
+
+  // A viewport point sitting on the first line of `needle` inside element `id`.
+  // Always recomputed fresh -- the element is scrolled into view first if it is
+  // not comfortably on screen, so any earlier coordinate is stale by definition.
+  window.__pointAtText = function (id, needle) {
+    var el = document.getElementById(id)
+    var b = el.getBoundingClientRect()
+    if (b.top < 70 || b.bottom > window.innerHeight - 40) {
+      el.scrollIntoView({ block: 'center', behavior: 'instant' })
+    }
+    var r = window.__rangeForText(el, needle)
+    if (!r) return null
+    var rects = Array.prototype.filter.call(r.getClientRects(),
+      function (q) { return q.width > 4 && q.height > 0 })
+    if (!rects.length) return null
+    var q = rects[0]
+    return {
+      x: Math.round(q.left + Math.min(25, q.width / 2)),
+      y: Math.round(q.top + q.height / 2),
+      rect: { left: q.left, top: q.top, width: q.width, height: q.height },
+      lines: rects.length,
+      onScreen: q.top > 0 && q.bottom < window.innerHeight
+    }
+  }
+
+  // How many lines does the whole element's text occupy right now?
+  window.__lineCount = function (id) {
+    var el = document.getElementById(id)
+    var r = document.createRange()
+    r.selectNodeContents(el)
+    return Array.prototype.filter.call(r.getClientRects(),
+      function (q) { return q.width > 4 && q.height > 0 }).length
+  }
+
+  // What click-to-seek recorded, flattened so it can cross the Playwright bridge.
+  window.__seek = function () {
+    var t = window.__raSeekTarget
+    if (!t) return null
+    return {
+      id: t.el && t.el.id, tag: t.el && t.el.tagName.toLowerCase(),
+      sentenceText: t.sentenceText
+    }
+  }
+  window.__resetSeek = function () { window.__raSeekTarget = null; window.__sent.length = 0 }
+  // Messages other than the 300 ms getPlaybackState poll.
+  window.__calls = function () {
+    return window.__sent.filter(function (m) { return m.method !== 'getPlaybackState' })
+  }
+</script>
+
+<script src="/js/punctuator.js"></script>
+<script src="/js/content/hover-overlay.js"></script>
+
+<script>
+const out = []
+let pass = 0, fail = 0
+function check(desc, cond, extra) {
+  if (cond) { pass++; out.push('  ok   ' + desc) }
+  else { fail++; out.push('  FAIL ' + desc + (extra ? '\n         ' + extra : '')) }
+}
+function section(name) { out.push('\n' + name) }
+
+// Render only once, at the very end. Every innerHTML write is a childList
+// mutation on document.body's subtree, which schedules hover-overlay.js's 500 ms
+// rescan -- and a rescan clears both overlays. Rendering as we go would knock
+// down the very highlights being measured.
+function render() {
+  document.getElementById('results').innerHTML = out.map(l =>
+    l.startsWith('  FAIL') ? '<span class="fail">' + l + '</span>' :
+    l.startsWith('  ok')   ? '<span class="ok">' + l + '</span>' : l).join('\n')
+}
+const wait = (ms) => new Promise(f => setTimeout(f, ms == null ? 60 : ms))
+const byId = id => document.getElementById(id)
+const text = id => byId(id).textContent
+
+// Drive the playback highlight through the fake service worker and report the
+// amber rects. Reset to STOPPED first so each probe starts from a clean slate,
+// and put the target on screen so applyPlaybackHighlight()'s auto-scroll (a
+// smooth scroll) never fires mid-measurement.
+async function probePlayback(id, needle) {
+  byId(id).scrollIntoView({ block: 'center', behavior: 'instant' })
+  await wait(100)
+  window.__fakeState = { state: 'STOPPED' }
+  await wait(400)
+  window.__fakeState = {
+    state: 'PLAYING',
+    speechInfo: { texts: [needle], position: { index: 0 } }
+  }
+  await wait(1500)   // idle poll is 1000ms, so allow a full cycle plus slack
+  return window.__playRects()
+}
+
+;(async function run() {
+  try {
+    section('bootstrap')
+    check('content script installed its re-entry guard', window.__raHoverOverlayActive === true)
+    check('brapi stub is what the script talks to', typeof brapi.runtime.sendMessage === 'function')
+
+    await wait(500)
+    check('polls getPlaybackState on its own',
+      window.__sent.some(m => m.method === 'getPlaybackState'),
+      JSON.stringify(window.__sent.slice(0, 3)))
+    check('poll is addressed to the service worker',
+      window.__sent.every(m => m.dest === 'serviceWorker'),
+      JSON.stringify(window.__sent.slice(0, 3)))
+
+    // ---- warm up both SVG layers -------------------------------------------
+    // Creating a layer appends a div to <body>, which the MutationObserver sees
+    // and answers with a rescan 500 ms later that clears both overlays. Do that
+    // once up front and let it settle, so later measurements are not racing a
+    // rescan that the measurement itself provoked.
+    section('overlay layers')
+    const p1box = byId('p1').getBoundingClientRect()
+    document.dispatchEvent(new MouseEvent('mousemove', {
+      clientX: Math.round(p1box.left + 30), clientY: Math.round(p1box.top + 8), bubbles: true
+    }))
+    window.__fakeState = {
+      state: 'PLAYING', speechInfo: { texts: [text('p1')], position: { index: 0 } }
+    }
+    await wait(1200)   // 300 ms poll + 500 ms rescan debounce + slack
+
+    const hovLayer = window.__layer(2147483646)
+    const actLayer = window.__layer(2147483644)
+    check('hover layer is a fixed full-screen div at z 2147483646',
+      hovLayer && hovLayer.style.position === 'fixed' && hovLayer.style.pointerEvents === 'none',
+      hovLayer && hovLayer.style.cssText)
+    check('playback layer is a fixed full-screen div at z 2147483644',
+      actLayer && actLayer.style.position === 'fixed' && actLayer.style.pointerEvents === 'none',
+      actLayer && actLayer.style.cssText)
+    check('playback layer sits below the hover layer',
+      Array.prototype.indexOf.call(document.body.children, actLayer) >= 0 &&
+      Number(actLayer.style.zIndex) < Number(hovLayer.style.zIndex))
+
+    // ---- playback highlight -------------------------------------------------
+    section('playback highlight')
+    let rects = await probePlayback('p1', text('p1'))
+    check('PLAYING state paints amber rects for the spoken text', rects.length > 0,
+      'rects=' + rects.length)
+    check('rects are amber at 0.35 opacity with rx 3',
+      rects.length > 0 && rects.every(r => r.fill === '#f5a623' && r.alpha === '0.35' && r.rx === '3'),
+      JSON.stringify(rects[0]))
+    check('rects are positioned over the paragraph being spoken',
+      window.__rectsOver(rects, 'p1'),
+      JSON.stringify(rects[0]) + ' vs ' + JSON.stringify(byId('p1').getBoundingClientRect()))
+    check('rect count matches the paragraph line count',
+      rects.length === window.__lineCount('p1'),
+      rects.length + ' rects vs ' + window.__lineCount('p1') + ' lines')
+
+    // index selects which of texts[] is spoken
+    window.__fakeState = {
+      state: 'PLAYING',
+      speechInfo: { texts: [text('p1'), text('h2')], position: { index: 1 } }
+    }
+    await wait(700)
+    rects = window.__playRects()
+    check('position.index selects the spoken text', window.__rectsOver(rects, 'h2'),
+      JSON.stringify(rects))
+    check('the previous highlight is gone', !window.__rectsOver(rects, 'p1'))
+
+    window.__fakeState = { state: 'STOPPED' }
+    await wait(700)
+    check('STOPPED clears the highlight', window.__playRects().length === 0,
+      JSON.stringify(window.__playRects()))
+
+    window.__fakeState = {
+      state: 'PLAYING', speechInfo: { texts: [text('h2')], position: { index: 0 } }
+    }
+    await wait(700)
+    check('highlight comes back after STOPPED', window.__playRects().length > 0)
+    window.__fakeState = { state: 'PAUSED' }
+    await wait(700)
+    check('PAUSED clears the highlight too', window.__playRects().length === 0)
+
+    // ---- which elements became blocks --------------------------------------
+    // blocks[] is private to the IIFE, so it is probed through the one thing that
+    // reads it without a mouse: findTextInBlocks(), which only ever searches
+    // block.textContent. Text that is in a block highlights; text that is not
+    // cannot highlight at all.
+    section('block scanning (probed through findTextInBlocks)')
+    check('a long <p> is a block', (await probePlayback('plong', text('plong'))).length > 0)
+    check('an <h2> is a block',    (await probePlayback('h2', text('h2'))).length > 0)
+    check('an <li> is a block',    (await probePlayback('li2', text('li2'))).length > 0)
+    check('a <blockquote> is a block', (await probePlayback('bq', 'Lead-in quotation line here.')).length > 0)
+
+    rects = await probePlayback('p1', text('p2'))
+    check('a <p> shorter than MIN_TEXT (12) is not a block', rects.length === 0,
+      JSON.stringify(text('p2')) + ' len=' + text('p2').length + ' rects=' + rects.length)
+
+    rects = await probePlayback('pmin', text('pmin'))
+    check('a <p> of exactly MIN_TEXT characters is a block', rects.length > 0,
+      JSON.stringify(text('pmin')) + ' len=' + text('pmin').length + ' rects=' + rects.length)
+
+    rects = await probePlayback('p1', text('asidep'))
+    check('a <p> inside an ignored <aside> is not a block', rects.length === 0,
+      'rects=' + rects.length)
+
+    window.__fakeState = { state: 'STOPPED' }
+    await wait(500)
+    check('left in a clean state for the live phase', window.__playRects().length === 0)
+  } catch (err) {
+    out.push('\nHARNESS ERROR: ' + ((err && err.stack) || err))
+    out.push('\n' + pass + ' passed, ' + fail + ' failed')
+    window.__done = { pass, fail, error: String(err) }
+    render()
+    return
+  }
+
+  out.push('\n' + pass + ' passed, ' + fail + ' failed')
+  window.__done = { pass, fail }
+  render()   // schedules one last rescan; the runner waits it out
+})()
+</script>
+</body>
+</html>

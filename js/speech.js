@@ -393,62 +393,6 @@ function Speech(texts, options) {
       return result;
     }
   }
-
-  function LatinPunctuator() {
-    this.getParagraphs = function(text) {
-      return recombine(text.split(/((?:\r?\n\s*){2,})/));
-    }
-    this.getSentences = function(text) {
-      return recombine(text.split(/([.!?]+[\s\u200b]+)/), /\b(\w|[A-Z][a-z]|Assn|Ave|Capt|Col|Comdr|Corp|Cpl|Gen|Gov|Hon|Inc|Lieut|Ltd|Rev|Univ|Jan|Feb|Mar|Apr|Aug|Sept|Oct|Nov|Dec|dept|ed|est|vol|vs)\.\s+$/);
-    }
-    this.getPhrases = function(sentence) {
-      return recombine(sentence.split(/([,;:]\s+|\s-+\s+|—\s*)/));
-    }
-    this.getWords = function(sentence) {
-      var tokens = sentence.split(/([~@#%^*_+=<>]|[\s\-—/]+|\.(?=\w{2,})|,(?=[0-9]))/);
-      var result = [];
-      for (var i=0; i<tokens.length; i+=2) {
-        if (tokens[i]) result.push(tokens[i]);
-        if (i+1 < tokens.length) {
-          if (/^[~@#%^*_+=<>]$/.test(tokens[i+1])) result.push(tokens[i+1]);
-          else if (result.length) result[result.length-1] += tokens[i+1];
-        }
-      }
-      return result;
-    }
-    function recombine(tokens, nonPunc) {
-      var result = [];
-      for (var i=0; i<tokens.length; i+=2) {
-        var part = (i+1 < tokens.length) ? (tokens[i] + tokens[i+1]) : tokens[i];
-        if (part) {
-          if (nonPunc && result.length && nonPunc.test(result[result.length-1])) result[result.length-1] += part;
-          else result.push(part);
-        }
-      }
-      return result;
-    }
-  }
-
-  function EastAsianPunctuator() {
-    this.getParagraphs = function(text) {
-      return recombine(text.split(/((?:\r?\n\s*){2,})/));
-    }
-    this.getSentences = function(text) {
-      return recombine(text.split(/([.!?]+[\s\u200b]+|[\u3002\uff01]+)/));
-    }
-    this.getPhrases = function(sentence) {
-      return recombine(sentence.split(/([,;:]\s+|[\u2025\u2026\u3000\u3001\uff0c\uff1b]+)/));
-    }
-    this.getWords = function(sentence) {
-      return sentence.replace(/\s+/g, "").split("");
-    }
-    function recombine(tokens) {
-      var result = [];
-      for (var i=0; i<tokens.length; i+=2) {
-        if (i+1 < tokens.length) result.push(tokens[i] + tokens[i+1]);
-        else if (tokens[i]) result.push(tokens[i]);
-      }
-      return result;
-    }
-  }
+
+
 }

@@ -6,7 +6,16 @@
     "doc": "docs"
   },
   "scripts": {
-    "package": "zip -r build/package.zip _locales css img js sound *.html manifest.json background.js -x \\*.map || true",
+    "test": "node test/punctuator.test.mjs",
+    "test:browser": "node test/browser/cross-browser.test.mjs",
+    "build": "node tools/build.mjs",
+    "build:chrome": "node tools/build.mjs chrome",
+    "build:firefox": "node tools/build.mjs firefox",
+    "manifest:chrome": "node tools/build-manifest.mjs chrome",
+    "manifest:firefox": "node tools/build-manifest.mjs firefox",
+    "package": "npm run package:chrome",
+    "package:chrome": "npm run build:chrome && cd build/chrome && zip -r ../read-aloud-chrome.zip . -x *.map || true",
+    "package:firefox": "npm run build:firefox && cd build/firefox && zip -r ../read-aloud-firefox.zip . -x *.map || true",
     "sync-page-scripts": "rsync -avz js/messaging.js page-scripts/ && aws s3 sync --delete --metadata-directive REPLACE --cache-control max-age=14400,public page-scripts s3://lsdsoftware-assets/read-aloud/page-scripts"
   },
   "repository": {
@@ -22,5 +31,8 @@
   "bugs": {
     "url": "https://github.com/ken107/read-aloud/issues"
   },
-  "homepage": "https://readaloud.app"
+  "homepage": "https://readaloud.app",
+  "devDependencies": {
+    "playwright": "^1.62.1"
+  }
 }

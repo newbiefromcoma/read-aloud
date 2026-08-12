@@ -50,7 +50,7 @@
         && location.port === "1122"
         && location.protocol === "http:"
         && location.pathname === "/bookshelf/index.html") return  ["js/content/yd-app-web.js"];
-    else return ["js/content/html-doc.js", "js/content/hover-overlay.js"];
+    else return ["js/punctuator.js", "js/content/html-doc.js", "js/content/hover-overlay.js"];
   }
 
   async function getCurrentIndex() {

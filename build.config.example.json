@@ -1,0 +1,21 @@
+{
+  "//": [
+    "Publisher identity for your own builds. Copy to build.config.json (gitignored) and fill in.",
+    "",
+    "Everything here is optional. Without it the browsers assign a development id,",
+    "which is what you want while working locally or running from source.",
+    "",
+    "chromeKey  the 'key' manifest property, which pins the Chrome extension id.",
+    "           Take it from the .pem you generate when you first pack the extension,",
+    "           or from the Chrome Web Store listing once published.",
+    "geckoId    the AMO add-on id, conventionally an email-shaped string on a domain",
+    "           you control, e.g. my-fork@example.com",
+    "oauth2     only needed if you add a Google OAuth flow. The upstream project ships",
+    "           this key but does not read it: sign-in goes through",
+    "           identity.launchWebAuthFlow against readaloud.app, not getAuthToken."
+  ],
+
+  "chromeKey": "",
+  "geckoId": "",
+  "oauth2": null
+}

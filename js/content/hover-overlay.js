@@ -2,20 +2,25 @@
 //
 // Three layers:
 //
-//   1. HOVER PREVIEW (purple, z:2147483646)
+//   1. HOVER PREVIEW (z:2147483646)
 //      mousemove (32 ms throttle) → blockFromPoint → charOffsetInBlock →
-//      sentenceAtOffset → createRangeForChars → getClientRects →
-//      per-line SVG <rect rx=3>
+//      sentenceAt → createRangeForChars → getClientRects → per-line SVG <rect>
 //
 //   2. CLICK-TO-SEEK
-//      pointerup → same pipeline → window.__raSeekTarget = {el, sentenceText}
-//      → brapi stop → brapi playTab   (html-doc.js consumes __raSeekTarget)
+//      pointerup → same pipeline →
+//      window.__raSeekTarget = {el, sentenceText} → brapi stop → brapi playTab
+//      (html-doc.js consumes __raSeekTarget)
 //
-//   3. PLAYBACK HIGHLIGHT (amber, z:2147483644)
-//      setInterval 300 ms → getPlaybackState → texts[position.index] →
-//      findTextInBlocks (textContent indexOf) → createRangeForChars →
-//      per-line SVG <rect rx=3>   Stored Range repositions on scroll.
-//      Auto-scrolls block into view when it leaves the viewport.
+//   3. PLAYBACK HIGHLIGHT (z:2147483644)
+//      poll getPlaybackState → texts[position.index] → findTextInBlocks →
+//      createRangeForChars → per-line SVG <rect>.  The Range is stored so scroll
+//      repositions without waiting for the next poll.  Follows the reading
+//      position, and stands down while the user is reading somewhere else.
+//
+// Sentence splitting comes from js/punctuator.js — the same splitter the speech
+// engine uses. A private copy would drift, and since a click resolves to a
+// sentence and then asks the engine to start there, drift means reading starts in
+// the wrong place.
 
 (function () {
   'use strict';
@@ -25,103 +30,172 @@
 
   // ── CONSTANTS ──────────────────────────────────────────────────────────────
 
-  const HOVER_MS     = 32;          // mousemove throttle ~30 fps
-  const POLL_MS      = 300;         // playback state poll interval
-  const MIN_TEXT     = 12;          // min chars for a block to be readable
-  const HOVER_COLOR  = '#6c63ff';   // purple  — hover preview
-  const HOVER_ALPHA  = '0.18';
-  const PLAY_COLOR   = '#f5a623';   // amber   — active playback sentence
-  const PLAY_ALPHA   = '0.35';
+  const HOVER_MS      = 32;     // mousemove throttle ~30 fps
+  const POLL_ACTIVE   = 300;    // playback poll while speaking
+  // While nothing is playing this only has to notice that playback *started*, so
+  // it doubles as the worst-case delay before the first highlight appears. Kept
+  // at a second: long enough to cut most of the idle traffic, short enough that
+  // pressing the toolbar button still feels immediate. Playback we start
+  // ourselves does not wait for it — see seekTo.
+  const POLL_IDLE     = 1000;
+  const MIN_TEXT      = 12;     // min chars for a block to be readable
+  const RESCAN_MS     = 500;    // debounce after DOM churn settles
+  const FOLLOW_PAUSE  = 1200;   // ignore our own scrolling for this long
 
-  const INTERACTIVE  = 'a,button,input,select,textarea,[contenteditable],[role="button"],[role="link"]';
+  // Highlight colours, chosen against the element's own text colour: light text
+  // means a dark page, which needs a brighter and more opaque highlight to read.
+  const HOVER_LIGHT = { fill: '#6c63ff', alpha: '0.18' };
+  const HOVER_DARK  = { fill: '#8f88ff', alpha: '0.30' };
+  const PLAY_LIGHT  = { fill: '#f5a623', alpha: '0.35' };
+  const PLAY_DARK   = { fill: '#ffc65c', alpha: '0.42' };
 
-  // Abbreviations whose period must NOT end a sentence
-  const ABBREVS = new Set([
-    'mr','mrs','ms','dr','prof','sr','jr','vs','etc',
-    'e.g','i.e','fig','no','vol','dept','approx','est',
-    'govt','inc','ltd','corp','co','st','ave','blvd',
-    'jan','feb','mar','apr','jun','jul','aug','sep','oct','nov','dec',
-    'u.s','u.k','u.n','p.m','a.m',
+  const INTERACTIVE = 'a,button,input,select,textarea,[contenteditable],[role="button"],[role="link"]';
+
+  const BLOCK_TAGS = new Set([
+    'p','li','blockquote','td','th','pre','figcaption',
+    'h1','h2','h3','h4','h5','h6'
   ]);
+
+  const IGNORE_SEL = (typeof readAloudDoc !== 'undefined' && readAloudDoc.ignoreTags)
+    ? readAloudDoc.ignoreTags
+    : 'select,textarea,button,label,audio,video,dialog,embed,nav,noframes,noscript,object,script,style,svg,aside,footer';
+
+  // Rough count of readable content, used only to notice the page gaining or
+  // losing a meaningful amount of text.
+  const CANDIDATE_SEL = 'p,li,blockquote,td,th,pre,figcaption,h1,h2,h3,h4,h5,h6';
 
   // ── STATE ──────────────────────────────────────────────────────────────────
 
-  let blocks    = [];
-  let blockMap  = new Map();      // el → index  (O(1) hit-test)
-  let sentCache = new WeakMap();  // el → [{text, start, end}]
+  let blocks   = [];
+  let blockMap = new Map();     // el → index  (O(1) hit-test)
 
-  // Hover SVG (purple, above playback layer)
+  // Per-element text and sentence splits.  Keyed by a generation counter rather
+  // than validated per entry: any DOM edit could move text, and bumping one
+  // integer is far cheaper than re-checking every element.
+  let cache      = new WeakMap();
+  let generation = 0;
+  let lastCandidateCount = 0;
+
+  // Hover layer (above the playback layer)
   let hovWrap = null, hovSvg = null, hovTimer = 0;
+  let hovered = null;           // {el, sentence} currently previewed
 
-  // Playback SVG (amber, below hover layer)
+  // Playback layer
   let actWrap = null, actSvg = null;
-  let actRange  = null;   // stored so scroll can repaint without waiting for poll
-  let pollTimer = null;
-  let lastPlayKey = '';   // "index:text" — skip repaint when unchanged
+  let actRange = null;          // stored so scroll can repaint without a poll
+  let actEl    = null;
+  let pollTimer = null, pollRate = 0;
+  let lastPlayKey = '';         // "index:text" — skip repaint when unchanged
 
-  // ── SENTENCE SPLITTING ─────────────────────────────────────────────────────
+  // Following the reading position
+  let followSuspended = false;
+  let selfScrollUntil = 0;
 
-  function splitSentences(text) {
-    if (!text) return [];
-    const results = [];
-    const re = /([.!?]['"»)\]]*)\s+(?=[A-Z"'«(\[])/g;
-    let last = 0, m;
-    while ((m = re.exec(text)) !== null) {
-      const prefix = text.slice(0, m.index + 1);
-      const abbr   = prefix.match(/\b([A-Za-z][a-z]*)\.$/);
-      if (abbr && ABBREVS.has(abbr[1].toLowerCase())) continue;
-      const end   = m.index + m[1].length;
-      const chunk = text.slice(last, end).trim();
-      if (chunk.length > 1) results.push({ text: chunk, start: last, end });
-      last = m.index + m[0].length;
+  // ── SENTENCES ──────────────────────────────────────────────────────────────
+  //
+  // The text a block contributes is not its textContent.  html-doc.js drops <sup>
+  // and the ignore list before handing text to the engine, and the overlay has to
+  // drop exactly the same things — sharing the splitter is not enough if the two
+  // sides feed it different text.
+  //
+  // Wikipedia is where this shows: a citation marker sits between the full stop
+  // and the space after it, so "…may lack clarity.[citation needed] For specific…"
+  // has no whitespace behind the stop and the sentence boundary disappears. The
+  // engine, reading "…may lack clarity. For specific…", splits it in two. The
+  // overlay offered one hover target spanning both, so the second sentence could
+  // not be picked and clicking it started reading from the first.
+
+  const SKIP_IN_BLOCK = 'sup,' + IGNORE_SEL;
+
+  function isSkipped(node, root) {
+    for (let el = node.parentElement; el && el !== root; el = el.parentElement) {
+      try { if (el.matches(SKIP_IN_BLOCK)) return true; } catch (_) {}
     }
-    const tail = text.slice(last).trim();
-    if (tail.length > 1) results.push({ text: tail, start: last, end: text.length });
-    return results.length ? results : [{ text: text.trim(), start: 0, end: text.length }];
+    return false;
   }
 
-  function getSentences(el) {
-    if (sentCache.has(el)) return sentCache.get(el);
-    const s = splitSentences(el.textContent);
-    sentCache.set(el, s);
-    return s;
+  // The text nodes that make up a block's readable text, in document order.
+  // Cached with the text and the splits, because the offsets the splitter returns
+  // only mean anything against this exact list — every offset→Range conversion has
+  // to walk the same nodes that produced the text.
+  function readableTextNodes(el) {
+    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    for (let n; (n = walker.nextNode());) if (!isSkipped(n, el)) nodes.push(n);
+    return nodes;
   }
 
-  function sentenceAt(sents, offset) {
-    for (const s of sents) {
+  function entry(el) {
+    let e = cache.get(el);
+    if (e && e.generation === generation) return e;
+    const nodes = readableTextNodes(el);
+    let text = '';
+    for (let i = 0; i < nodes.length; i++) text += nodes[i].textContent;
+    e = {
+      generation,
+      nodes,
+      text,
+      // getSentencesWithOffsets comes from js/punctuator.js, loaded ahead of this
+      // file.  Guard anyway: a missing dependency should degrade to one sentence
+      // per block, not throw on every mousemove.
+      sentences: (typeof getSentencesWithOffsets === 'function')
+        ? getSentencesWithOffsets(text, document.documentElement.lang)
+        : [{ text: text.trim(), raw: text, start: 0, end: text.length }]
+    };
+    cache.set(el, e);
+    return e;
+  }
+
+  function sentenceAt(sentences, offset) {
+    for (const s of sentences) {
       if (offset >= s.start && offset <= s.end) return s;
     }
-    return sents[sents.length - 1] || null;
+    return sentences[sentences.length - 1] || null;
   }
 
-  // ── CURSOR → CHAR OFFSET  (Speechify Xe() technique) ──────────────────────
+  // ── CURSOR → CHAR OFFSET ───────────────────────────────────────────────────
+
+  function caretAt(x, y) {
+    // Chrome shipped caretRangeFromPoint; Firefox implements the standard
+    // caretPositionFromPoint.  Try both so neither is left without it.
+    try {
+      if (document.caretRangeFromPoint) {
+        const r = document.caretRangeFromPoint(x, y);
+        if (r) return { node: r.startContainer, offset: r.startOffset };
+      }
+      if (document.caretPositionFromPoint) {
+        const p = document.caretPositionFromPoint(x, y);
+        if (p) return { node: p.offsetNode, offset: p.offset };
+      }
+    } catch (_) { /* detached node, cross-origin frame */ }
+    return null;
+  }
 
   function charOffsetInBlock(x, y, el) {
-    let range = null;
-    if (document.caretRangeFromPoint) {
-      range = document.caretRangeFromPoint(x, y);
-    } else if (document.caretPositionFromPoint) {
-      const pos = document.caretPositionFromPoint(x, y);
-      if (pos) { range = document.createRange(); range.setStart(pos.offsetNode, pos.offset); }
-    }
-    if (!range) return 0;
-    const tn = range.startContainer;
-    if (tn.nodeType !== Node.TEXT_NODE || !el.contains(tn)) return 0;
-    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    const caret = caretAt(x, y);
+    if (!caret || caret.node.nodeType !== Node.TEXT_NODE || !el.contains(caret.node)) return 0;
+    const nodes = entry(el).nodes;
     let off = 0;
-    for (let node; (node = walker.nextNode());) {
-      if (node === tn) return off + range.startOffset;
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
+      if (node === caret.node) return off + caret.offset;
+      // The caret is in text we skipped — the cursor is over a citation marker.
+      // Snap to the boundary in front of it rather than reporting 0, which would
+      // name the first sentence of the block wherever the marker happened to be.
+      if (node.compareDocumentPosition(caret.node) & Node.DOCUMENT_POSITION_PRECEDING) return off;
       off += node.textContent.length;
     }
-    return 0;
+    return off;
   }
 
   // ── CHAR POSITIONS → DOM RANGE ─────────────────────────────────────────────
 
   function createRangeForChars(el, startChar, endChar) {
-    const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    // The same node list the offsets were measured against — see entry().
+    const nodes = entry(el).nodes;
     let offset = 0, sNode, sOff, eNode, eOff;
-    for (let node; (node = walker.nextNode());) {
+    for (let i = 0; i < nodes.length; i++) {
+      const node = nodes[i];
       const len = node.textContent.length;
       if (!sNode && offset + len > startChar) {
         sNode = node;
@@ -147,35 +221,38 @@
   }
 
   // ── BLOCK FROM CURSOR POINT ────────────────────────────────────────────────
+  //
+  // Two strategies, both O(depth).  The old third strategy measured every block
+  // on the page with getBoundingClientRect to find the nearest — that ran on the
+  // hover path and thrashed layout on long articles for an answer that was a
+  // guess anyway.  If neither lookup finds a block, the cursor is not over one.
 
-  function blockFromPoint(x, y) {
-    try {
-      if (document.caretRangeFromPoint) {
-        const range = document.caretRangeFromPoint(x, y);
-        if (range) {
-          let node = range.startContainer;
-          if (node.nodeType === Node.TEXT_NODE) node = node.parentElement;
-          while (node && node !== document.body) {
-            const idx = blockMap.get(node);
-            if (idx !== undefined) return idx;
-            node = node.parentElement;
-          }
-        }
-      }
-    } catch (_) { /* cross-origin frame, ShadowRoot, or detached node */ }
-    let best = -1, bestD = Infinity;
-    blocks.forEach((el, i) => {
-      try {
-        const r = el.getBoundingClientRect();
-        if (r.width === 0 && r.height === 0) return;
-        const d = Math.abs((r.top + r.bottom) / 2 - y);
-        if (d < bestD) { bestD = d; best = i; }
-      } catch (_) {}
-    });
-    return best;
+  function blockAt(node) {
+    for (let el = (node && node.nodeType === Node.TEXT_NODE) ? node.parentElement : node;
+         el && el !== document.body;
+         el = el.parentElement) {
+      const idx = blockMap.get(el);
+      if (idx !== undefined) return idx;
+    }
+    return -1;
   }
 
-  // ── LINE RECTS FROM RANGE ──────────────────────────────────────────────────
+  function blockFromPoint(x, y) {
+    const caret = caretAt(x, y);
+    if (caret) {
+      const idx = blockAt(caret.node);
+      if (idx >= 0) return idx;
+    }
+    // elementFromPoint still resolves when the point is in an element's padding
+    // or over a float, where there is no caret to find.
+    try {
+      const idx = blockAt(document.elementFromPoint(x, y));
+      if (idx >= 0) return idx;
+    } catch (_) {}
+    return -1;
+  }
+
+  // ── RECTS ──────────────────────────────────────────────────────────────────
 
   function getLineRects(range) {
     if (!range) return [];
@@ -184,39 +261,47 @@
     } catch (_) { return []; }
   }
 
-  // ── CURSOR HIT-TEST ────────────────────────────────────────────────────────
-  //
-  // caretRangeFromPoint() snaps to the nearest character even when the cursor
-  // is in empty margin space beside a line.  We reject hover unless the cursor
-  // is physically over (or between adjacent lines of) the sentence's text rects.
-  //
-  //   PAD_X — small horizontal fuzz so the very edge of a glyph still triggers
-  //   inter-line gap — if cursor Y is between rect[i].bottom and rect[i+1].top
-  //     (the typographic leading gap) we still consider it "over" the sentence
-
+  // caretRangeFromPoint snaps to the nearest character even when the cursor is in
+  // empty margin beside a line, so reject hover unless the cursor really is over
+  // the text — allowing a little horizontal fuzz and the leading gap between lines.
   function cursorNearRects(x, y, rects) {
     if (!rects.length) return false;
     const PAD_X = 4;
     for (let i = 0; i < rects.length; i++) {
       const r = rects[i];
-      // Cursor must be horizontally inside the text run (± PAD_X)
       if (x < r.left - PAD_X || x > r.right + PAD_X) continue;
-      // Vertically inside this line rect
       if (y >= r.top && y <= r.bottom) return true;
-      // Vertically in the leading gap between this line and the next
       if (i + 1 < rects.length && y > r.bottom && y < rects[i + 1].top) return true;
     }
     return false;
   }
 
+  // ── COLOUR ─────────────────────────────────────────────────────────────────
+
+  // ITU-R BT.601 luma of the element's *text* colour.  Text colour is always
+  // resolvable; the effective background frequently is not (transparent stacks,
+  // images, gradients), so this is the reliable signal for light-vs-dark.
+  function isDarkPage(el) {
+    try {
+      const m = /^rgba?\(([^)]+)\)/i.exec(getComputedStyle(el).color);
+      if (!m) return false;
+      const p = m[1].split(/[,/\s]+/).filter(Boolean).map(parseFloat);
+      if (p.length < 3) return false;
+      return (299 * p[0] + 587 * p[1] + 114 * p[2]) / 1000 >= 160;
+    } catch (_) { return false; }
+  }
+
   // ── SVG HELPERS ────────────────────────────────────────────────────────────
+
+  const SVG_NS = 'http://www.w3.org/2000/svg';
 
   function makeSvgLayer(zIndex) {
     const wrap = document.createElement('div');
+    wrap.setAttribute('data-read-aloud-overlay', 'true');
     wrap.style.cssText =
       'position:fixed;top:0;left:0;width:100%;height:100%;' +
       'pointer-events:none;z-index:' + zIndex + ';overflow:hidden';
-    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    const svg = document.createElementNS(SVG_NS, 'svg');
     svg.style.cssText =
       'position:absolute;top:0;left:0;width:100%;height:100%;overflow:visible';
     wrap.appendChild(svg);
@@ -224,19 +309,36 @@
     return { wrap, svg };
   }
 
-  function fillSvg(svg, rects, color, alpha) {
-    while (svg.firstChild) svg.removeChild(svg.firstChild);
+  // Update the rects already there rather than rebuilding them.  This runs on
+  // every mousemove and on every scroll frame; discarding and recreating the
+  // nodes each time is a style recalc and an allocation per line for nothing —
+  // only the geometry actually changes between frames.
+  function syncRects(svg, rects, colour) {
+    if (!svg) return;
+    const kids = svg.childNodes;
+    let n = 0;
     for (const r of rects) {
-      const el = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-      el.setAttribute('x',            (r.left   - 1).toFixed(1));
-      el.setAttribute('y',            (r.top    - 1).toFixed(1));
-      el.setAttribute('width',        (r.width  + 2).toFixed(1));
-      el.setAttribute('height',       (r.height + 2).toFixed(1));
-      el.setAttribute('rx',           '3');
-      el.setAttribute('fill',         color);
-      el.setAttribute('fill-opacity', alpha);
-      svg.appendChild(el);
+      let el = kids[n];
+      if (!el) {
+        el = document.createElementNS(SVG_NS, 'rect');
+        el.setAttribute('rx', '3');
+        svg.appendChild(el);
+      }
+      el.setAttribute('x',      (r.left   - 1).toFixed(1));
+      el.setAttribute('y',      (r.top    - 1).toFixed(1));
+      el.setAttribute('width',  (r.width  + 2).toFixed(1));
+      el.setAttribute('height', (r.height + 2).toFixed(1));
+      if (el.__fill !== colour.fill) {
+        el.setAttribute('fill', colour.fill);
+        el.__fill = colour.fill;
+      }
+      if (el.__alpha !== colour.alpha) {
+        el.setAttribute('fill-opacity', colour.alpha);
+        el.__alpha = colour.alpha;
+      }
+      n++;
     }
+    while (kids.length > n) svg.removeChild(svg.lastChild);
   }
 
   function clearSvg(svg) {
@@ -251,35 +353,32 @@
     hovWrap = layer.wrap; hovSvg = layer.svg;
   }
 
-  function clearHover() { clearSvg(hovSvg); }
+  function clearHover() {
+    clearSvg(hovSvg);
+    hovered = null;
+  }
 
   function updateHover(x, y) {
     try {
       const idx = blockFromPoint(x, y);
-      if (idx < 0) { clearHover(); return; }
+      if (idx < 0) return clearHover();
       const el = blocks[idx];
-      if (!el) { clearHover(); return; }   // stale index — rescan pending
-      const sents = getSentences(el);
-      const off   = charOffsetInBlock(x, y, el);
-      const sent  = sentenceAt(sents, off);
-      if (!sent) { clearHover(); return; }
-      const range = createRangeForChars(el, sent.start, sent.end);
-      const rects = getLineRects(range);
-      // Reject if cursor is in the empty margin beside the text line
-      if (!cursorNearRects(x, y, rects)) { clearHover(); return; }
+      if (!el) return clearHover();              // stale index — rescan pending
+
+      const e = entry(el);
+      const sentence = sentenceAt(e.sentences, charOffsetInBlock(x, y, el));
+      if (!sentence) return clearHover();
+
+      const rects = getLineRects(createRangeForChars(el, sentence.start, sentence.end));
+      if (!cursorNearRects(x, y, rects)) return clearHover();
+
       ensureHovSvg();
-      fillSvg(hovSvg, rects, HOVER_COLOR, HOVER_ALPHA);
+      syncRects(hovSvg, rects, isDarkPage(el) ? HOVER_DARK : HOVER_LIGHT);
+      hovered = { el, sentence };
     } catch (_) { clearHover(); }
   }
 
   // ── PLAYBACK HIGHLIGHT ─────────────────────────────────────────────────────
-  //
-  // Poll getPlaybackState every POLL_MS.
-  // texts[position.index] = currently spoken sentence (Supertonic/Piper) or
-  //   750-char chunk (Chrome TTS).
-  // Search block.textContent with a 4-tier fallback:
-  //   exact → case-insensitive → 40-char prefix exact → 40-char prefix CI
-  // Store the Range so scroll can repaint instantly without waiting for a poll.
 
   function ensureActSvg() {
     if (actWrap) return;
@@ -289,24 +388,32 @@
 
   function clearPlayback() {
     clearSvg(actSvg);
-    actRange   = null;
+    actRange = null;
+    actEl = null;
     lastPlayKey = '';
   }
 
   function repaintPlayback() {
     if (!actRange || !actSvg) return;
-    fillSvg(actSvg, getLineRects(actRange), PLAY_COLOR, PLAY_ALPHA);
+    syncRects(actSvg, getLineRects(actRange), isDarkPage(actEl || document.body) ? PLAY_DARK : PLAY_LIGHT);
   }
 
   function findTextInBlocks(needle) {
     if (!needle || !needle.trim()) return null;
     const prefix = needle.slice(0, 40);
+    const lowerNeedle = needle.toLowerCase();
+    const lowerPrefix = prefix.toLowerCase();
     for (const block of blocks) {
-      const tc = block.textContent;
+      // A block removed since the last scan still answers indexOf with the text it
+      // used to hold, and the Range built from it has no client rects — so the
+      // highlight would land nowhere and silently blank out.  Skipping it lets the
+      // search fall through to a live block that has the same text.
+      if (!block.isConnected) continue;
+      const tc = entry(block).text;      // cached; textContent is not cheap
       let pos = tc.indexOf(needle);
-      if (pos < 0) pos = tc.toLowerCase().indexOf(needle.toLowerCase());
+      if (pos < 0) pos = tc.toLowerCase().indexOf(lowerNeedle);
       if (pos < 0) pos = tc.indexOf(prefix);
-      if (pos < 0) pos = tc.toLowerCase().indexOf(prefix.toLowerCase());
+      if (pos < 0) pos = tc.toLowerCase().indexOf(lowerPrefix);
       if (pos < 0) continue;
       const end   = Math.min(tc.length, pos + needle.length);
       const range = createRangeForChars(block, pos, end);
@@ -319,35 +426,67 @@
     return rect.bottom < 0 || rect.top > window.innerHeight;
   }
 
+  // Follow the reading position, but never take the page away from someone who
+  // scrolled somewhere themselves.  A timer cannot know whether they are still
+  // reading that diagram three screens up, so following resumes on position
+  // instead: once the highlight is back on screen by itself — because they
+  // scrolled back, or because reading caught up — there is nothing to do anyway.
+  function follow(rects, block) {
+    if (!rects.length) return;
+    const onScreen = !isRectOffscreen(rects[0]);
+    if (followSuspended) {
+      if (!onScreen) return;
+      followSuspended = false;
+      return;
+    }
+    if (onScreen) return;
+    selfScrollUntil = Date.now() + FOLLOW_PAUSE;
+    try {
+      block.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    } catch (_) {
+      block.scrollIntoView(true);
+    }
+  }
+
   function applyPlaybackHighlight(needle) {
     const found = findTextInBlocks(needle);
-    if (!found) { clearPlayback(); return; }
+    if (!found) return clearPlayback();
 
     actRange = found.range;
+    actEl = found.block;
     const rects = getLineRects(actRange);
     ensureActSvg();
-    fillSvg(actSvg, rects, PLAY_COLOR, PLAY_ALPHA);
+    syncRects(actSvg, rects, isDarkPage(actEl) ? PLAY_DARK : PLAY_LIGHT);
+    follow(rects, found.block);
+  }
 
-    // Auto-scroll: bring the highlighted sentence into view if it left viewport
-    if (rects.length > 0 && isRectOffscreen(rects[0])) {
-      found.block.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
+  // ── PLAYBACK POLLING ───────────────────────────────────────────────────────
+  //
+  // Poll rate follows the state: there is no reason to ask every 300 ms while
+  // nothing is playing, and this runs for the whole life of every tab.
+
+  function setPollRate(ms) {
+    if (pollRate === ms) return;
+    pollRate = ms;
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(pollPlayback, ms);
   }
 
   async function pollPlayback() {
     let result;
     try {
       result = await safeSend({ dest: 'serviceWorker', method: 'getPlaybackState' });
-    } catch (_) { return; }  // service worker sleeping or no player yet
+    } catch (_) { return; }   // service worker asleep, or no player yet
 
     if (!result || result.state !== 'PLAYING') {
-      // Clear the highlight when paused/stopped, but don't stop polling —
-      // the user may press play again at any time.
+      setPollRate(POLL_IDLE);
       if (result && (result.state === 'PAUSED' || result.state === 'STOPPED')) {
         clearPlayback();
+        followSuspended = false;
       }
       return;
     }
+    setPollRate(POLL_ACTIVE);
 
     const info = result.speechInfo;
     if (!info || !info.texts || !info.texts.length) return;
@@ -357,7 +496,7 @@
     if (!text) return;
 
     const key = idx + ':' + text;
-    if (key === lastPlayKey) return;   // no change — skip DOM work
+    if (key === lastPlayKey) return;   // no change — skip the DOM work
     lastPlayKey = key;
 
     applyPlaybackHighlight(text);
@@ -365,16 +504,14 @@
 
   // ── SAFE MESSAGING ────────────────────────────────────────────────────────
   //
-  // chrome.runtime.sendMessage() throws synchronously with
-  // "Extension context invalidated" when the service worker has restarted
-  // (idle timeout, extension reload) while this content script is still live.
-  // That happens before a Promise is returned, so .catch() on the call-site
-  // can't catch it.  Wrap every outgoing message here instead.
+  // chrome.runtime.sendMessage() throws synchronously with "Extension context
+  // invalidated" when the service worker has restarted (idle timeout, extension
+  // reload) while this content script is still live.  That happens before a
+  // Promise exists, so .catch() at the call site cannot catch it.
 
   function safeSend(msg) {
     try {
       const p = brapi.runtime.sendMessage(msg);
-      // brapi may return undefined for one-way messages
       return (p && typeof p.then === 'function') ? p : Promise.resolve(null);
     } catch (_) {
       return Promise.resolve(null);
@@ -382,6 +519,28 @@
   }
 
   // ── CLICK-TO-SEEK ──────────────────────────────────────────────────────────
+
+  function seekTo(el, sentence) {
+    // Signal html-doc.js's parse() to start from this sentence
+    window.__raSeekTarget = {
+      el: el,
+      sentenceText: sentence.text.replace(/\s+/g, ' ').trim()
+    };
+
+    clearHover();
+    clearPlayback();
+    followSuspended = false;
+    //We know playback is about to start, so do not make the highlight wait for
+    //the idle poll to come round.
+    setPollRate(POLL_ACTIVE);
+
+    safeSend({ dest: 'serviceWorker', method: 'stop' })
+      .catch(function () {})
+      .then(function () {
+        return safeSend({ dest: 'serviceWorker', method: 'playTab' });
+      })
+      .catch(function (err) { console.error('[RA hover] playTab failed:', err); });
+  }
 
   function handlePointerUp(e) {
     try {
@@ -392,28 +551,11 @@
       const idx = blockFromPoint(e.clientX, e.clientY);
       if (idx < 0) return;
       const el = blocks[idx];
-      if (!el) return;   // stale index — rescan pending
-      const sents = getSentences(el);
-      const off   = charOffsetInBlock(e.clientX, e.clientY, el);
-      const sent  = sentenceAt(sents, off);
-      if (!sent) return;
+      if (!el) return;                            // stale index — rescan pending
+      const sentence = sentenceAt(entry(el).sentences, charOffsetInBlock(e.clientX, e.clientY, el));
+      if (!sentence) return;
 
-      // Signal html-doc.js's parse() to start from this sentence
-      window.__raSeekTarget = {
-        el:           el,
-        sentenceText: sent.text.replace(/\s+/g, ' ').trim()
-      };
-
-      // Clear both overlays — they will repopulate once new playback starts
-      clearHover();
-      clearPlayback();
-
-      safeSend({ dest: 'serviceWorker', method: 'stop' })
-        .catch(function () {})
-        .then(function () {
-          return safeSend({ dest: 'serviceWorker', method: 'playTab' });
-        })
-        .catch(function (err) { console.error('[RA hover] playTab failed:', err); });
+      seekTo(el, sentence);
     } catch (err) {
       console.error('[RA hover] click handler error:', err);
     }
@@ -429,14 +571,10 @@
     return r.width > 0 || r.height > 0;
   }
 
-  const BLOCK_TAGS = new Set([
-    'p','li','blockquote','td','th','pre','figcaption',
-    'h1','h2','h3','h4','h5','h6'
-  ]);
-
-  const IGNORE_SEL = (typeof readAloudDoc !== 'undefined' && readAloudDoc.ignoreTags)
-    ? readAloudDoc.ignoreTags
-    : 'select,textarea,button,label,audio,video,dialog,embed,nav,noframes,noscript,object,script,style,svg,aside,footer';
+  function candidateCount() {
+    try { return document.querySelectorAll(CANDIDATE_SEL).length; }
+    catch (_) { return lastCandidateCount; }
+  }
 
   function scanBlocks() {
     const candidates = [];
@@ -460,61 +598,134 @@
       return true;
     });
     blockMap = new Map(blocks.map(function (el, i) { return [el, i]; }));
+    lastCandidateCount = candidateCount();
   }
 
   // ── EVENT WIRING ───────────────────────────────────────────────────────────
 
-  // Hover preview
   document.addEventListener('mousemove', function (e) {
     if (hovTimer) return;
     hovTimer = setTimeout(function () { hovTimer = 0; }, HOVER_MS);
     if (e.target.closest && e.target.closest(INTERACTIVE)) { clearHover(); return; }
-    ensureHovSvg();
     updateHover(e.clientX, e.clientY);
   }, { capture: true, passive: true });
 
   document.addEventListener('mouseleave', clearHover, { capture: true });
 
-  // Scroll: hover clears (stale viewport coords), playback repositions from stored Range
+  // Scroll: the hover preview is dropped (its coordinates are stale the moment
+  // the page moves) and the playback highlight repositions from its stored Range.
+  // Batched into a frame — scroll fires far more often than the screen updates.
+  let scrollQueued = false;
   document.addEventListener('scroll', function () {
-    clearHover();
-    repaintPlayback();
+    if (scrollQueued) return;
+    scrollQueued = true;
+    requestAnimationFrame(function () {
+      scrollQueued = false;
+      clearHover();
+      repaintPlayback();
+    });
   }, { capture: true, passive: true });
 
-  // Click to seek
   document.addEventListener('pointerup', handlePointerUp, { capture: true });
+
+  // The user taking over.  Watching the input rather than the scroll event is
+  // what makes this reliable: our own scrollIntoView produces scroll events too,
+  // and telling them apart after the fact is guesswork.
+  const SCROLL_KEYS = { ArrowUp:1, ArrowDown:1, PageUp:1, PageDown:1, Home:1, End:1, ' ':1, Spacebar:1 };
+
+  function userTookOver() {
+    if (Date.now() < selfScrollUntil) return;   // our own smooth scroll settling
+    followSuspended = true;
+  }
+
+  window.addEventListener('wheel', userTookOver, { capture: true, passive: true });
+  window.addEventListener('touchmove', userTookOver, { capture: true, passive: true });
+  window.addEventListener('keydown', function (e) {
+    if (!SCROLL_KEYS[e.key]) return;
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    userTookOver();
+  }, { capture: true });
 
   // ── SPA / DYNAMIC CONTENT RESCAN ──────────────────────────────────────────
   //
-  // React/Vue SPAs tear down and rebuild DOM on navigation.  When that happens
-  // blocks[] and blockMap become stale — old indices no longer map to live
-  // elements.  Watch for structural DOM mutations and re-scan after a short
-  // debounce (500 ms) so the new content is fully rendered first.
-  // Changes inside our own SVG overlay divs are deliberately ignored.
+  // Apps rebuild the DOM without a navigation, which leaves blocks[] and blockMap
+  // pointing at elements that are gone.  A MutationObserver notices, but it fires
+  // constantly on any busy page, so the callback only arms a debounce and the
+  // decision is made afterwards: rescan when the blocks have actually gone stale,
+  // or when the amount of readable content has moved materially.  Mutations
+  // inside our own overlays are ignored — otherwise drawing a highlight would
+  // schedule a rescan of the page it is drawn on.
 
   let rescanTimer = null;
+
+  // Sampled rather than exhaustive so this stays cheap on very long pages, but
+  // sampled *across* the list: content is normally removed from one region, and a
+  // prefix sample never sees a region that is not at the front.  Measured on the
+  // Wikipedia "Speech synthesis" article, 151 of 503 indexed blocks were detached
+  // and every one of them sat past position 345, so a first-12 sample reported the
+  // index as healthy and it never self-corrected.
+  //
+  // The trigger is the same 15% materiality used for the candidate delta below.
+  // A detached block is always wrong, but one stray removal is not worth a full
+  // walk of the document — that is the whole point of the gate.
+  const STALE_SAMPLE = 32;
+
+  function blocksAreStale() {
+    if (!blocks.length) return false;
+    const stride = Math.max(1, Math.floor(blocks.length / STALE_SAMPLE));
+    let checked = 0, detached = 0;
+    for (let i = 0; i < blocks.length && checked < STALE_SAMPLE; i += stride) {
+      const el = blocks[i];
+      if (!el) continue;
+      checked++;
+      if (!el.isConnected) detached++;
+    }
+    return checked > 0 && detached / checked > 0.15;
+  }
+
+  function contentChangedMaterially() {
+    if (!blocks.length) return true;
+    if (blocksAreStale()) return true;
+    const delta = Math.abs(candidateCount() - lastCandidateCount);
+    return delta >= Math.max(4, lastCandidateCount * 0.15);
+  }
 
   function scheduleRescan() {
     if (rescanTimer) clearTimeout(rescanTimer);
     rescanTimer = setTimeout(function () {
       rescanTimer = null;
+      if (!contentChangedMaterially()) return;
       clearHover();
       clearPlayback();
-      sentCache = new WeakMap();   // sentence splits for old elements are stale
+      generation++;              // every cached text and split now describes the old DOM
       scanBlocks();
-    }, 500);
+    }, RESCAN_MS);
+  }
+
+  function isOurNode(node) {
+    return !!(node && node.nodeType === 1 && node.closest &&
+              node.closest('[data-read-aloud-overlay]'));
+  }
+
+  function isOurMutation(m) {
+    if (isOurNode(m.target)) return true;
+    const touched = [];
+    for (let i = 0; i < m.addedNodes.length; i++) touched.push(m.addedNodes[i]);
+    for (let j = 0; j < m.removedNodes.length; j++) touched.push(m.removedNodes[j]);
+    if (!touched.length) return true;
+    for (let k = 0; k < touched.length; k++) if (!isOurNode(touched[k])) return false;
+    return true;
   }
 
   const domObserver = new MutationObserver(function (mutations) {
     for (let i = 0; i < mutations.length; i++) {
       const m = mutations[i];
       if (m.type !== 'childList') continue;
-      if (m.addedNodes.length === 0 && m.removedNodes.length === 0) continue;
-      // Skip mutations inside our own overlay wrappers
-      if (hovWrap && hovWrap.contains(m.target)) continue;
-      if (actWrap && actWrap.contains(m.target)) continue;
+      if (!m.addedNodes.length && !m.removedNodes.length) continue;
+      if (isOurMutation(m)) continue;
       scheduleRescan();
-      return;   // one rescan is enough — debounce handles the rest
+      return;                    // one rescan is enough — the debounce handles the rest
     }
   });
 
@@ -524,9 +735,8 @@
 
   scanBlocks();
 
-  // Start polling immediately — Read Aloud may already be playing (e.g. user
-  // clicked the toolbar button, then scrolled down).  300 ms is cheap enough
-  // to run continuously while the tab is open.
-  pollTimer = setInterval(pollPlayback, POLL_MS);
+  // Start polling straight away: Read Aloud may already be speaking (the user
+  // could have pressed the toolbar button before this script was injected).
+  setPollRate(POLL_ACTIVE);
 
 })();

@@ -17,11 +17,8 @@
     "activeTab",
     "contextMenus",
     "identity",
-    "offscreen",
     "scripting",
-    "storage",
-    "tts",
-    "ttsEngine"
+    "storage"
   ],
   "optional_permissions": [
     "webRequest",
@@ -45,8 +42,7 @@
       ],
       "matches": [
         "<all_urls>"
-      ],
-      "use_dynamic_url": true
+      ]
     }
   ],
   "options_page": "options.html",
@@ -81,15 +77,5 @@
       },
       "description": "Rewind"
     }
-  },
-  "minimum_chrome_version": "99",
-  "cross_origin_opener_policy": {
-    "value": "same-origin"
-  },
-  "cross_origin_embedder_policy": {
-    "value": "require-corp"
-  },
-  "background": {
-    "service_worker": "background.js"
   }
 }
